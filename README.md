@@ -7,3 +7,4 @@ This is a project to learn the Rust programming language. Using the ChaCha20 Alg
 Missing Features:
 - Threads
 - Comments
+- Polish
