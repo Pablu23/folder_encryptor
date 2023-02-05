@@ -11,6 +11,7 @@ use std::{
     io::{Read, Write},
     // time::SystemTime,
 };
+use uuid::Uuid;
 
 extern crate rpassword;
 
@@ -26,20 +27,22 @@ fn encrypt_file(
 ) -> io::Result<()> {
     let mut cipher = XChaCha20::new(key[..32].as_ref().into(), nonce.into());
 
-    let source_file = Path::new(&source_path);
+    let source_file_path = Path::new(&source_path);
 
-    if !source_file.try_exists()? {
+    if !source_file_path.try_exists()? {
         return Err(io::Error::from(io::ErrorKind::NotFound));
     }
 
-    let file_name = source_file.file_name().unwrap_or_default();
-    let path = dest_path + "/" + file_name.to_str().unwrap_or_default() + ".cha";
+    let file_name = source_file_path.file_name().unwrap_or_default();
+
+    let uuid = Uuid::new_v4();
+    let path = dest_path + "/" + &uuid.to_string() + ".cha";
 
     if Path::new(&path).try_exists()? {
         fs::remove_file(&path)?;
     }
 
-    let mut source_file = File::open(source_path)?;
+    let mut source_file = File::open(&source_path)?;
     let mut dest_file = File::create(path)?;
 
     // Stack allocated buffer
@@ -49,6 +52,21 @@ fn encrypt_file(
     let mut buffer = vec![0u8; BUFFER_LEN].into_boxed_slice();
 
     dest_file.write(nonce)?;
+
+    let mut f_name_bytes = file_name.to_str().unwrap_or_default().as_bytes().to_owned();
+
+    cipher.apply_keystream(&mut f_name_bytes);
+
+    if f_name_bytes.len() > u16::MAX.into() {
+        // TODO: Return a better Error, this doesnt make any sense at all
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+
+    let size: u16 = f_name_bytes.len() as u16;
+
+    let f_name_len: [u8; 2] = size.to_le_bytes();
+    dest_file.write(&f_name_len)?;
+    dest_file.write(&f_name_bytes)?;
 
     loop {
         let read_count = source_file.read(&mut buffer).unwrap();
@@ -62,6 +80,8 @@ fn encrypt_file(
             break;
         }
     }
+
+    fs::remove_file(source_file_path)?;
 
     return Ok(());
 }
@@ -75,14 +95,13 @@ fn decrypt_file(source_path: String, pwd: &String, config: &argon2::Config) -> i
         return Err(io::Error::from(io::ErrorKind::NotFound));
     }
 
-    let path = &source_path[..&source_path.len() - 4];
+    //let path = &source_path[..&source_path.len() - 4];
 
-    if Path::new(&path).exists() {
-        fs::remove_file(&path)?;
-    }
+    // if Path::new(&path).exists() {
+    //     fs::remove_file(&path)?;
+    // }
 
     let mut source_file = File::open(&source_path)?;
-    let mut dest_file = File::create(path)?;
 
     source_file.read(&mut nonce)?;
 
@@ -93,22 +112,55 @@ fn decrypt_file(source_path: String, pwd: &String, config: &argon2::Config) -> i
     // Stack allocated buffer
     // let mut buffer = [0u8; BUFFER_LEN];
 
+    let mut file_name_size_buffer: [u8; 2] = [0u8, 2];
+    source_file.read(&mut file_name_size_buffer)?;
+    let file_name_size = u16::from_le_bytes(file_name_size_buffer);
+
+    println!("File Name Size: {file_name_size}");
+
+    let mut file_name_bytes = vec![0u8; file_name_size.into()];
+    source_file.read_exact(&mut file_name_bytes)?;
+
+    cipher.apply_keystream(&mut file_name_bytes);
+
+    let private_dir_path = match path_info.parent() {
+        Some(p) => Ok(p),
+        None => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+    }?;
+
+    let root_dir_path = match private_dir_path.parent() {
+        Some(p) => Ok(p),
+        None => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+    }?;
+
+    let file_name = String::from_utf8(file_name_bytes).unwrap_or_default();
+    let path = root_dir_path.join(&file_name); //to_str().unwrap_or_default().to_owned() + &file_name;
+
+    println!("File Name: {file_name}\n Path: {path:?}");
+
+    let mut dest_file = File::create(path)?;
+
+    println!("Worked!");
+
     // Heap allocated buffer (Allows larger sized buffer, up to 50 % max ram)
     let mut buffer = vec![0u8; BUFFER_LEN].into_boxed_slice();
 
     loop {
-        let read_count = source_file.read(&mut buffer).unwrap();
+        let read_count = source_file.read(&mut buffer)?;
+
+        println!("Read Bytes {read_count}");
 
         if read_count == BUFFER_LEN {
             cipher.apply_keystream(&mut buffer);
-            dest_file.write(&buffer).unwrap();
+            dest_file.write(&buffer)?;
         } else {
             cipher.apply_keystream(&mut buffer[..read_count]);
-            dest_file.write(&buffer[..read_count]).unwrap();
+            dest_file.write(&buffer[..read_count])?;
             break;
         }
     }
 
+    println!("Fully written");
     return Ok(());
 }
 
@@ -141,6 +193,8 @@ fn main() -> io::Result<()> {
                 fs::remove_file(String::from(path.to_str().unwrap()))?;
             }
         }
+
+        fs::remove_dir(private)?;
 
         //fs::remove_dir_all(private).unwrap();
     } else {
@@ -192,67 +246,5 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // let start = SystemTime::now();
-
-    // let source_path = String::from("E:\\Programieren\\Rust\\folder_encryptor\\1gb.test.bin.cha");
-    // // let plaintext: String = String::from("Das ist ein Test string");
-    // let pwd: String = String::from("TestPassword!");
-
-    // // let mut nonce = [0u8; 24];
-    // // OsRng.fill_bytes(&mut nonce);
-
-    // // let key = argon2::hash_raw(pwd.as_bytes(), &nonce, &config).unwrap();
-
-    // decrypt_file(source_path, &pwd, &config)?;
-
-    // let encrypt_time = start.elapsed().unwrap();
-
-    // println!("Encrypt took {encrypt_time:?}");
-
     Ok(())
-
-    // let start = SystemTime::now();
-
-    // Decrypt Part
-    //dist_file.seek(SeekFrom::Start(0)).unwrap();
-    // drop(dist_file);
-
-    // cipher.seek(0u32);
-
-    // let mut dist_file = File::open(dist_path).unwrap();
-    // let decrypted_path = source_path.clone() + ".decrypted.bin";
-    // let mut decrypted_file = File::create(decrypted_path).unwrap();
-
-    // let mut read_nonce = [0u8; 24];
-
-    // let nonce_size = dist_file.read(&mut read_nonce).unwrap();
-
-    // assert_eq!(24, nonce_size);
-    // assert_eq!(read_nonce, nonce);
-
-    // let t = dist_file.stream_position().unwrap();
-
-    // println!("{t}");
-
-    // let mut decrypt_buffer = [0u8; BUFFER_LEN];
-
-    // loop {
-    //     let read_count = dist_file.read(&mut decrypt_buffer).unwrap();
-
-    //     println!("Decrypt Read: {read_count}");
-
-    //     if read_count == BUFFER_LEN {
-    //         cipher.apply_keystream(&mut decrypt_buffer);
-    //         decrypted_file.write(&decrypt_buffer).unwrap();
-    //     } else {
-    //         cipher.apply_keystream(&mut decrypt_buffer[..read_count]);
-    //         decrypted_file.write(&decrypt_buffer[..read_count]).unwrap();
-    //         break;
-    //     }
-    // }
-
-    // let decrypt_time = start.elapsed().unwrap();
-
-    // println!("Encrypt took {encrypt_time:?}");
-    // println!("Decrypt took {decrypt_time:?}");
 }
