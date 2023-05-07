@@ -1,8 +1,11 @@
+use anyhow::{bail, Result};
+use argon2::Config;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::XChaCha20;
 use rand::RngCore;
 use rand_core::OsRng;
-use std::path::Path;
+use std::fs::ReadDir;
+use std::path::{Path, PathBuf};
 use std::{
     env,
     fs,
@@ -21,56 +24,43 @@ use rpassword::read_password;
 
 const BUFFER_LEN: usize = 50 * 1024 * 1024; // 50 MiB
 
-fn encrypt_file(
+pub fn encrypt_file(
     source_path: String,
-    dest_path: String,
-    nonce: [u8; 24],
-    key: &[u8],
-) -> io::Result<()> {
+    root_path: &String,
+    pwd: &String,
+    config: &Config,
+) -> Result<()> {
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let key = argon2::hash_raw(pwd.as_bytes(), &nonce, &config)?;
     let mut cipher = XChaCha20::new(key[..32].as_ref().into(), &nonce.into());
 
-    let source_file_path = Path::new(&source_path);
-
-    if !source_file_path.try_exists()? {
-        return Err(io::Error::from(io::ErrorKind::NotFound));
-    }
-
-    let file_name = source_file_path.file_name().unwrap_or_default();
-
     let uuid = Uuid::new_v4();
-    let path = dest_path + "/" + &uuid.to_string() + ".cha";
+    let dest_path = root_path.to_owned() + "/private/" + &uuid.to_string() + ".cha";
 
-    if Path::new(&path).try_exists()? {
-        fs::remove_file(&path)?;
-    }
+    let origin_path = Path::new(&source_path).strip_prefix(root_path)?;
 
     let mut source_file = File::open(&source_path)?;
-    let mut dest_file = File::create(path)?;
+    let mut dest_file = File::create(dest_path)?;
 
-    // Stack allocated buffer
-    // let mut buffer = [0u8; BUFFER_LEN];
-
-    println!("Start encrypting File: {}", file_name.to_str().unwrap());
-
-    // Heap allocated buffer (Allows larger sized buffer, up to 50 % max ram)
     let mut buffer = vec![0u8; BUFFER_LEN].into_boxed_slice();
 
     dest_file.write(&nonce)?;
+    let mut origin_path_bytes = origin_path
+        .to_str()
+        .expect("Origin Path can convert to string")
+        .as_bytes()
+        .to_owned();
+    cipher.apply_keystream(&mut origin_path_bytes);
 
-    let mut f_name_bytes = file_name.to_str().unwrap_or_default().as_bytes().to_owned();
-
-    cipher.apply_keystream(&mut f_name_bytes);
-
-    if f_name_bytes.len() > u16::MAX.into() {
-        // TODO: Return a better Error, this doesnt make any sense at all
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    if origin_path_bytes.len() > u32::MAX.try_into()? {
+        bail!("Origin String too long");
     }
 
-    let size: u16 = f_name_bytes.len() as u16;
-
-    let f_name_len: [u8; 2] = size.to_le_bytes();
-    dest_file.write(&f_name_len)?;
-    dest_file.write(&f_name_bytes)?;
+    let size: u32 = origin_path_bytes.len() as u32;
+    let size_bytes: [u8; 4] = size.to_le_bytes();
+    dest_file.write(&size_bytes)?;
+    dest_file.write(&origin_path_bytes)?;
 
     loop {
         let read_count = source_file.read(&mut buffer).unwrap();
@@ -85,58 +75,51 @@ fn encrypt_file(
         }
     }
 
-    fs::remove_file(source_file_path)?;
-
-    println!("Finished encrypting File: {}", file_name.to_str().unwrap());
+    fs::remove_file(source_path)?;
 
     Ok(())
 }
 
-fn decrypt_file(source_path: &Path, pwd: &String, config: &argon2::Config) -> io::Result<()> {
+pub fn decrypt_file(source_path: &Path, pwd: &String, config: &Config) -> Result<()> {
     let mut nonce = [0u8; 24];
-
     if !source_path.try_exists()? {
-        return Err(io::Error::from(io::ErrorKind::NotFound));
+        bail!("File not found");
     }
 
     let mut source_file = File::open(&source_path)?;
 
     source_file.read(&mut nonce)?;
 
-    let key = argon2::hash_raw(pwd.as_bytes(), &nonce, config).unwrap();
+    let key = argon2::hash_raw(pwd.as_bytes(), &nonce, &config)?;
 
     let mut cipher = XChaCha20::new(key[..32].as_ref().into(), &nonce.into());
-
-    // Stack allocated buffer
-    // let mut buffer = [0u8; BUFFER_LEN];
-
-    let mut file_name_size_buffer: [u8; 2] = [0u8, 2];
+    let mut file_name_size_buffer: [u8; 4] = [0u8; 4];
     source_file.read(&mut file_name_size_buffer)?;
-    let file_name_size = u16::from_le_bytes(file_name_size_buffer);
 
-    let mut file_name_bytes = vec![0u8; file_name_size.into()];
-    source_file.read_exact(&mut file_name_bytes)?;
+    let file_name_size = u32::from_le_bytes(file_name_size_buffer);
+    let mut file_name_buffer = vec![0u8; file_name_size.try_into()?];
+    source_file.read(&mut file_name_buffer)?;
 
-    cipher.apply_keystream(&mut file_name_bytes);
+    cipher.apply_keystream(&mut file_name_buffer);
 
     let private_dir_path = match source_path.parent() {
-        Some(p) => Ok(p),
-        None => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+        Some(p) => Ok::<&Path, anyhow::Error>(p),
+        None => bail!("Private dir could not be extracted"),
     }?;
 
     let root_dir_path = match private_dir_path.parent() {
-        Some(p) => Ok(p),
-        None => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+        Some(p) => Ok::<&Path, anyhow::Error>(p),
+        None => bail!("Root dir could not be extracted"),
     }?;
 
-    let file_name = String::from_utf8(file_name_bytes).unwrap_or_default();
+    let file_name = String::from_utf8(file_name_buffer)?;
     let path = root_dir_path.join(&file_name);
 
-    println!("Start decrypting File: {file_name}");
+    let prefix = path.parent().expect("No parent Directory");
+    std::fs::create_dir_all(prefix)?;
 
     let mut dest_file = File::create(path)?;
 
-    // Heap allocated buffer (Allows larger sized buffer, up to 50 % max ram, technically more)
     let mut buffer = vec![0u8; BUFFER_LEN].into_boxed_slice();
 
     loop {
@@ -151,8 +134,25 @@ fn decrypt_file(source_path: &Path, pwd: &String, config: &argon2::Config) -> io
             break;
         }
     }
+    Ok(())
+}
 
-    println!("Finished decrypting File: {file_name}");
+fn populate_file_list(
+    root_dir: fs::ReadDir,
+    file_list: &mut Vec<PathBuf>,
+    dir_list: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    for path in root_dir {
+        let path = path.unwrap().path();
+        if path.is_file() {
+            file_list.push(path);
+        } else if path.is_dir() {
+            let dir = fs::read_dir(&path).unwrap();
+            dir_list.push(path);
+            populate_file_list(dir, file_list, dir_list)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -224,14 +224,14 @@ fn main() -> io::Result<()> {
 
         fs::remove_dir(private)?;
     } else {
-        let paths = fs::read_dir(&cwd).unwrap();
+        let root_dir = fs::read_dir(&cwd).unwrap();
+        let mut paths = vec![];
+        let mut dir_list = vec![];
 
-        for path_result in paths {
-            let path = path_result.unwrap().path();
+        populate_file_list(root_dir, &mut paths, &mut dir_list).unwrap();
 
-            if path.is_file() && path != exe {
-                println!("{path:?}");
-            }
+        for path in &paths {
+            println!("{path:?}");
         }
 
         println!("Encrypt files? [y]es / [n]o");
@@ -253,34 +253,26 @@ fn main() -> io::Result<()> {
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
 
-        // let key = Arc::new(argon2::hash_raw(pwd.as_bytes(), &nonce, &config).unwrap());
-
-        let paths = fs::read_dir(cwd).unwrap();
         let exe = Arc::new(exe);
-        let private = Arc::new(private);
+        // let private = Arc::new(private);
 
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(max_threads);
         let mut current_threads = 0;
+        let cwd: Arc<String> = Arc::from(String::from(cwd.to_str().unwrap()));
 
-        for path_result in paths {
+        for path in paths {
             let pwd = pwd.clone();
             let exe = exe.clone();
-            let private = private.clone();
             let config = config.clone();
+            let cwd = cwd.clone();
 
             handles.push(thread::spawn(move || {
-                let mut nonce = [0u8; 24];
-                OsRng.fill_bytes(&mut nonce);
-                let key = argon2::hash_raw(pwd.as_bytes(), &nonce, &config).unwrap();
-
-                let path = path_result.unwrap().path();
-
                 if path.is_file() && path.as_os_str() != exe.as_os_str() {
                     encrypt_file(
                         String::from(path.to_str().unwrap()),
-                        String::from(private.to_str().unwrap()),
-                        nonce,
-                        &key,
+                        &cwd.to_string(),
+                        &pwd.to_string(),
+                        &config,
                     )
                     .unwrap();
                 }
@@ -300,6 +292,10 @@ fn main() -> io::Result<()> {
                 handle.join().unwrap();
                 current_threads -= 1;
             }
+        }
+
+        for dir in dir_list {
+            fs::remove_dir_all(dir)?;
         }
     }
 
