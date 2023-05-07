@@ -45,6 +45,8 @@ pub fn encrypt_file(
 
     let mut buffer = vec![0u8; BUFFER_LEN].into_boxed_slice();
 
+    println!("Now encrypting {source_path}");
+
     dest_file.write(&nonce)?;
     let mut origin_path_bytes = origin_path
         .to_str()
@@ -75,6 +77,8 @@ pub fn encrypt_file(
         }
     }
 
+    println!("Finished encrypthing {source_path}");
+
     fs::remove_file(source_path)?;
 
     Ok(())
@@ -85,6 +89,8 @@ pub fn decrypt_file(source_path: &Path, pwd: &String, config: &Config) -> Result
     if !source_path.try_exists()? {
         bail!("File not found");
     }
+
+    println!("Start decrypting File {source_path:?}");
 
     let mut source_file = File::open(&source_path)?;
 
@@ -134,6 +140,9 @@ pub fn decrypt_file(source_path: &Path, pwd: &String, config: &Config) -> Result
             break;
         }
     }
+
+    println!("Finished decrpyting File {file_name}");
+
     Ok(())
 }
 
