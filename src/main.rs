@@ -118,7 +118,10 @@ pub fn decrypt_file(source_path: &Path, pwd: &String, config: &Config) -> Result
         None => bail!("Root dir could not be extracted"),
     }?;
 
-    let file_name = String::from_utf8(file_name_buffer)?;
+    let mut file_name = String::from_utf8(file_name_buffer)?;
+    if cfg!(unix) {
+        file_name = file_name.replace("\\", "/");
+    }
     let path = root_dir_path.join(&file_name);
 
     let prefix = path.parent().expect("No parent Directory");
