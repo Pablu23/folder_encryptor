@@ -18,6 +18,7 @@ use std::{
     thread::{available_parallelism, JoinHandle},
 };
 use std::{hint, panic};
+use threadpool::DecryptJob;
 use uuid::Uuid;
 
 mod threadpool;
@@ -94,7 +95,7 @@ pub fn decrypt_file(source_path: PathBuf, pwd: String, config: Config) -> Result
         bail!("File not found");
     }
 
-    println!("Start decrypting File {source_path:?}");
+    // println!("Start decrypting File {source_path:?}");
     let mut source_file = File::open(&source_path)?;
 
     source_file.read(&mut nonce)?;
@@ -148,7 +149,7 @@ pub fn decrypt_file(source_path: PathBuf, pwd: String, config: Config) -> Result
         }
     }
 
-    println!("Finished decrpyting File {file_name}");
+    // println!("Finished decrpyting File {file_name}");
     fs::remove_file(source_path)?;
 
     Ok(())
@@ -205,33 +206,38 @@ fn main() -> io::Result<()> {
         std::io::stdout().flush().unwrap();
         let pwd = read_password().unwrap();
 
-        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(max_threads);
-        let curr_threads = Arc::new(AtomicUsize::new(0));
+        // let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(max_threads);
+        // let curr_threads = Arc::new(AtomicUsize::new(0));
+
+        let mut pool = threadpool::ThreadPool::new(max_threads);
 
         for path in paths {
-            let path = path.unwrap().path();
-            let pwd = pwd.clone();
-            let config = config.clone();
-            let curr_threads_clone = curr_threads.clone();
-
-            handles.push(thread::spawn(move || {
-                curr_threads_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if path.is_file() {
-                    decrypt_file(path, pwd, config).unwrap();
-                }
-
-                curr_threads_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            }));
-
-            while curr_threads.load(std::sync::atomic::Ordering::SeqCst) >= max_threads {
-                hint::spin_loop();
-            }
+            let job = DecryptJob::new(path.unwrap().path(), pwd.clone(), config.clone());
+            let _ = pool.queue(job);
+            // let pwd = pwd.clone();
+            // let config = config.clone();
+            // let curr_threads_clone = curr_threads.clone();
+            //
+            // handles.push(thread::spawn(move || {
+            //     curr_threads_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            //     if path.is_file() {
+            //         decrypt_file(path, pwd, config).unwrap();
+            //     }
+            //
+            //     curr_threads_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // }));
+            //
+            // while curr_threads.load(std::sync::atomic::Ordering::SeqCst) >= max_threads {
+            //     hint::spin_loop();
+            // }
         }
+        
+        println!("Finished queuing all jobs, waiting for jobs to finish");
+        // for thread in handles {
+        //     thread.join().unwrap();
+        // }
 
-        for thread in handles {
-            thread.join().unwrap();
-        }
-
+        pool.wait();
         thread::sleep(time::Duration::from_millis(10));
         fs::remove_dir(private)?;
     } else {
